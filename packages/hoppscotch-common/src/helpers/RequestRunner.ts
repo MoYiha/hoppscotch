@@ -293,6 +293,83 @@ const filterNonEmptyEnvironmentVariables = (
   return Array.from(envsMap.values())
 }
 
+/**
+ * Preserves Blob/File objects from the original request body when merging with updated request
+ * This ensures file uploads aren't lost when scripts modify other request properties
+ * @param originalRequest The original request with Blob/File objects
+ * @param updatedRequest The request returned from scripting context (Blobs lost in serialization)
+ * @returns Merged request with Blobs preserved
+ */
+function preserveBlobsInRequest(
+  originalRequest: HoppRESTRequest,
+  updatedRequest: Partial<HoppRESTRequest>
+): HoppRESTRequest {
+  // If the body wasn't modified by scripts, preserve the original (with Blobs)
+  if (!updatedRequest.body) {
+    return { ...originalRequest, ...updatedRequest }
+  }
+
+  // If body was modified but it's multipart/form-data, we need to preserve Blobs
+  if (
+    originalRequest.body.contentType === "multipart/form-data" &&
+    updatedRequest.body.contentType === "multipart/form-data"
+  ) {
+    const originalBody = originalRequest.body.body
+    const updatedBody = updatedRequest.body.body
+
+    // Restore Blobs from original request to updated body
+    const mergedBody = updatedBody.map((updatedField, index) => {
+      const originalField = originalBody[index]
+
+      // If original field was a file field, restore it
+      // Note: After JSON serialization, file fields become text fields due to Zod transform
+      // (empty file array gets converted to isFile: false, value: "")
+      // So we check the ORIGINAL field, not the updated one
+      if (originalField && originalField.isFile) {
+        // Restore the original file field completely
+        return {
+          ...updatedField,
+          value: originalField.value,
+          isFile: true as const,
+        }
+      }
+
+      return updatedField
+    })
+
+    return {
+      ...originalRequest,
+      ...updatedRequest,
+      body: {
+        contentType: "multipart/form-data" as const,
+        body: mergedBody as typeof originalBody,
+        showIndividualContentType:
+          updatedRequest.body.showIndividualContentType,
+        isBulkEditing: updatedRequest.body.isBulkEditing,
+      },
+    }
+  }
+
+  // If body is application/octet-stream with a Blob, preserve it
+  if (
+    originalRequest.body.contentType === "application/octet-stream" &&
+    updatedRequest.body.contentType === "application/octet-stream" &&
+    originalRequest.body.body instanceof Blob
+  ) {
+    return {
+      ...originalRequest,
+      ...updatedRequest,
+      body: {
+        ...updatedRequest.body,
+        body: originalRequest.body.body, // Preserve the original Blob
+      },
+    }
+  }
+
+  // For other body types, use the updated body as-is
+  return { ...originalRequest, ...updatedRequest }
+}
+
 const delegatePreRequestScriptRunner = (
   request: HoppRESTRequest,
   envs: {
@@ -468,10 +545,10 @@ export function runRESTRequest$(
         secret,
       }))
 
-    const finalRequest = {
-      ...resolvedRequest,
-      ...(preRequestScriptResult.right.updatedRequest ?? {}),
-    }
+    const finalRequest = preserveBlobsInRequest(
+      resolvedRequest,
+      preRequestScriptResult.right.updatedRequest ?? {}
+    )
 
     // Propagate changes to request variables from the scripting context to the UI
     tab.value.document.request.requestVariables = finalRequest.requestVariables

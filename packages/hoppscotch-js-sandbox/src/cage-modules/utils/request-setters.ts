@@ -16,7 +16,7 @@ import { RequestSetterMethodsResult } from "~/types"
  */
 export const createRequestSetterMethods = (
   ctx: CageModuleCtx,
-  request: HoppRESTRequest
+  request: HoppRESTRequest,
 ): RequestSetterMethodsResult => {
   const { methods: requestMethods, updatedRequest } =
     getRequestSetterMethods(request)
@@ -31,49 +31,49 @@ export const createRequestSetterMethods = (
       "setRequestMethod",
       (method: any) => {
         requestMethods.setMethod(method as string)
-      }
+      },
     ),
     setRequestHeader: defineSandboxFn(
       ctx,
       "setRequestHeader",
       (name: any, value: any) => {
         requestMethods.setHeader(name as string, value as string)
-      }
+      },
     ),
     setRequestHeaders: defineSandboxFn(
       ctx,
       "setRequestHeaders",
       (headers: any) => {
         requestMethods.setHeaders(headers as HoppRESTHeaders)
-      }
+      },
     ),
     removeRequestHeader: defineSandboxFn(
       ctx,
       "removeRequestHeader",
       (key: any) => {
         requestMethods.removeHeader(key as string)
-      }
+      },
     ),
     setRequestParam: defineSandboxFn(
       ctx,
       "setRequestParam",
       (name: any, value: any) => {
         requestMethods.setParam(name as string, value as string)
-      }
+      },
     ),
     setRequestParams: defineSandboxFn(
       ctx,
       "setRequestParams",
       (params: any) => {
         requestMethods.setParams(params as HoppRESTParams)
-      }
+      },
     ),
     removeRequestParam: defineSandboxFn(
       ctx,
       "removeRequestParam",
       (key: any) => {
         requestMethods.removeParam(key as string)
-      }
+      },
     ),
     setRequestBody: defineSandboxFn(ctx, "setRequestBody", (body: any) => {
       requestMethods.setBody(body as HoppRESTReqBody)
@@ -86,7 +86,7 @@ export const createRequestSetterMethods = (
       "setRequestVariable",
       (key: any, value: any) => {
         requestMethods.setRequestVariable(key as string, value as string)
-      }
+      },
     ),
   }
 
