@@ -18,6 +18,7 @@ import {
   UpdateMockServerInput,
   MockServerMutationArgs,
   MockServerCollection,
+  MockServerLog,
 } from './mock-server.model';
 import * as E from 'fp-ts/Either';
 import { OffsetPaginationArgs } from 'src/types/input-types.args';
@@ -25,14 +26,16 @@ import { GqlTeamMemberGuard } from 'src/team/guards/gql-team-member.guard';
 import { RequiresTeamRole } from 'src/team/decorators/requires-team-role.decorator';
 import { TeamAccessRole } from 'src/team/team.model';
 import { throwErr } from 'src/utils';
+import { MockServerAnalyticsService } from './mock-server-analytics.service';
 
 @Resolver(() => MockServer)
 export class MockServerResolver {
-  constructor(private readonly mockServerService: MockServerService) {}
+  constructor(private readonly mockServerService: MockServerService, private readonly mockServerAnalyticsService: MockServerAnalyticsService) {}
 
   // Resolve Fields
 
   @ResolveField(() => User, {
+    nullable: true,
     description: 'Returns the creator of the mock server',
   })
   async creator(@Parent() mockServer: MockServer): Promise<User> {
@@ -110,6 +113,30 @@ export class MockServerResolver {
     return result.right;
   }
 
+  @Query(() => [MockServerLog], {
+    description: 'Get logs for a specific mock server with pagination, sorted by execution time (most recent first)',
+  })
+  @UseGuards(GqlAuthGuard)
+  async mockServerLogs(
+    @GqlUser() user: User,
+    @Args({
+      name: 'mockServerID',
+      type: () => ID,
+      description: 'ID of the mock server',
+    })
+    mockServerID: string,
+    @Args() args: OffsetPaginationArgs,
+  ): Promise<MockServerLog[]> {
+    const result = await this.mockServerService.getMockServerLogs(
+      mockServerID,
+      user.uid,
+      args,
+    );
+
+    if (E.isLeft(result)) throwErr(result.left);
+    return result.right;
+  }
+
   // Mutations
 
   @Mutation(() => MockServer, {
@@ -155,6 +182,28 @@ export class MockServerResolver {
   ): Promise<boolean> {
     const result = await this.mockServerService.deleteMockServer(
       args.id,
+      user.uid,
+    );
+
+    if (E.isLeft(result)) throwErr(result.left);
+    return result.right;
+  }
+
+  @Mutation(() => Boolean, {
+    description: 'Delete a mock server log by log ID',
+  })
+  @UseGuards(GqlAuthGuard)
+  async deleteMockServerLog(
+    @GqlUser() user: User,
+     @Args({
+      name: 'logID',
+      type: () => ID,
+      description: 'Id of the log to delete',
+    })
+    logID: string,
+  ): Promise<boolean> {
+    const result = await this.mockServerService.deleteMockServerLog(
+      logID,
       user.uid,
     );
 

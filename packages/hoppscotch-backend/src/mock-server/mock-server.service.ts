@@ -1,12 +1,12 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { PubSubService } from 'src/pubsub/pubsub.service';
 import {
   CreateMockServerInput,
   UpdateMockServerInput,
   MockServerResponse,
   MockServer,
   MockServerCollection,
+  MockServerLog,
 } from './mock-server.model';
 import { User } from 'src/user/user.model';
 import * as E from 'fp-ts/Either';
@@ -18,16 +18,24 @@ import {
   MOCK_SERVER_CREATION_FAILED,
   MOCK_SERVER_UPDATE_FAILED,
   MOCK_SERVER_DELETION_FAILED,
+  MOCK_SERVER_LOG_NOT_FOUND,
+  MOCK_SERVER_LOG_DELETION_FAILED,
 } from 'src/errors';
 import { randomBytes } from 'crypto';
 import { WorkspaceType } from 'src/types/WorkspaceTypes';
-import { TeamAccessRole, MockServer as dbMockServer } from '@prisma/client';
+import {
+  MockServerAction,
+  TeamAccessRole,
+  MockServer as dbMockServer,
+} from '@prisma/client';
 import { OffsetPaginationArgs } from 'src/types/input-types.args';
 import { ConfigService } from '@nestjs/config';
+import { MockServerAnalyticsService } from './mock-server-analytics.service';
 
 @Injectable()
 export class MockServerService {
   constructor(
+    private readonly mockServerAnalyticsService: MockServerAnalyticsService,
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
   ) {}
@@ -38,15 +46,19 @@ export class MockServerService {
   private cast(dbMockServer: dbMockServer): MockServer {
     // Generate path based mock server URL
     const backendUrl = this.configService.get<string>('VITE_BACKEND_API_URL');
-    const base = backendUrl.substring(0, backendUrl.lastIndexOf('/')); // "http://localhost:3170"
+    const base = backendUrl.substring(0, backendUrl.lastIndexOf('/')); // "http(s)://localhost:3170"
     const serverUrlPathBased = base + '/mock/' + dbMockServer.subdomain;
 
     // Generate domain based mock server URL
+    // MOCK_SERVER_WILDCARD_DOMAIN = '*.mock.hopp.io'
     const wildcardDomain = this.configService.get<string>(
       'INFRA.MOCK_SERVER_WILDCARD_DOMAIN',
     );
+    const isSecure =
+      this.configService.get<string>('INFRA.ALLOW_SECURE_COOKIES') === 'true';
+    const protocol = isSecure ? 'https://' : 'http://';
     const serverUrlDomainBased = wildcardDomain
-      ? 'http://' + dbMockServer.subdomain + '.' + wildcardDomain
+      ? protocol + dbMockServer.subdomain + wildcardDomain.substring(1)
       : null;
 
     return {
@@ -102,6 +114,52 @@ export class MockServerService {
   }
 
   /**
+   * Check if user has access to a team with specific roles
+   */
+  private async checkTeamAccess(
+    teamId: string,
+    userUid: string,
+    requiredRoles: TeamAccessRole[],
+  ): Promise<boolean> {
+    const team = await this.prisma.team.findFirst({
+      where: {
+        id: teamId,
+        members: {
+          some: {
+            userUid,
+            role: { in: requiredRoles },
+          },
+        },
+      },
+    });
+    return !!team;
+  }
+
+  /**
+   * Check if user has access to a mock server with specific roles
+   */
+  async checkMockServerAccess(
+    mockServer: dbMockServer,
+    userUid: string,
+    requiredRoles: TeamAccessRole[] = [
+      TeamAccessRole.OWNER,
+      TeamAccessRole.EDITOR,
+      TeamAccessRole.VIEWER,
+    ],
+  ): Promise<boolean> {
+    if (mockServer.workspaceType === WorkspaceType.USER) {
+      return mockServer.creatorUid === userUid;
+    } else if (mockServer.workspaceType === WorkspaceType.TEAM) {
+      return this.checkTeamAccess(
+        mockServer.workspaceID,
+        userUid,
+        requiredRoles,
+      );
+    }
+    return false;
+  }
+
+  /**
    * Get a specific mock server by ID
    */
   async getMockServer(id: string, userUid: string) {
@@ -111,30 +169,8 @@ export class MockServerService {
     if (!mockServer) return E.left(MOCK_SERVER_NOT_FOUND);
 
     // Check access permissions
-    if (mockServer.workspaceType === WorkspaceType.USER) {
-      if (mockServer.creatorUid !== userUid) {
-        return E.left(MOCK_SERVER_NOT_FOUND);
-      }
-    } else if (mockServer.workspaceType === WorkspaceType.TEAM) {
-      const isMember = await this.prisma.team.findFirst({
-        where: {
-          id: mockServer.workspaceID,
-          members: {
-            some: {
-              userUid,
-              role: {
-                in: [
-                  TeamAccessRole.OWNER,
-                  TeamAccessRole.EDITOR,
-                  TeamAccessRole.VIEWER,
-                ],
-              },
-            },
-          },
-        },
-      });
-      if (!isMember) return E.left(MOCK_SERVER_NOT_FOUND);
-    }
+    const hasAccess = await this.checkMockServerAccess(mockServer, userUid);
+    if (!hasAccess) return E.left(MOCK_SERVER_NOT_FOUND);
 
     return E.right(this.cast(mockServer));
   }
@@ -142,12 +178,14 @@ export class MockServerService {
   /**
    * Get a mock server by subdomain (for incoming mock requests)
    * Returns database model with collectionID for internal use
+   * @param subdomain - The subdomain of the mock server
+   * @param includeInactive - If true, returns mock server regardless of active status (default: false)
    */
-  async getMockServerBySubdomain(subdomain: string) {
+  async getMockServerBySubdomain(subdomain: string, includeInactive = false) {
     const mockServer = await this.prisma.mockServer.findFirst({
       where: {
         subdomain: { equals: subdomain, mode: 'insensitive' },
-        isActive: true,
+        ...(includeInactive ? {} : { isActive: true }),
         deletedAt: null,
       },
     });
@@ -170,6 +208,10 @@ export class MockServerService {
     return E.right(mockServer.user);
   }
 
+  /**
+   * (Field resolver)
+   * Get the collection of a mock server
+   */
   async getMockServerCollection(mockServerId: string) {
     const mockServer = await this.prisma.mockServer.findUnique({
       where: { id: mockServerId, deletedAt: null },
@@ -214,19 +256,13 @@ export class MockServerService {
     if (input.workspaceType === WorkspaceType.TEAM) {
       if (!input.workspaceID) return E.left(TEAM_INVALID_ID);
 
-      const team = await this.prisma.team.findUnique({
-        where: {
-          id: input.workspaceID,
-          members: {
-            some: {
-              userUid: user.uid,
-              role: { in: [TeamAccessRole.OWNER, TeamAccessRole.EDITOR] },
-            },
-          },
-        },
-      });
+      const hasAccess = await this.checkTeamAccess(
+        input.workspaceID,
+        user.uid,
+        [TeamAccessRole.OWNER, TeamAccessRole.EDITOR],
+      );
 
-      if (!team) return E.left(TEAM_INVALID_ID);
+      if (!hasAccess) return E.left(TEAM_INVALID_ID);
     }
 
     return E.right(true);
@@ -302,6 +338,11 @@ export class MockServerService {
           delayInMs: input.delayInMs,
         },
       });
+      this.mockServerAnalyticsService.recordActivity(
+        mockServer,
+        MockServerAction.CREATED,
+        user.uid,
+      );
 
       return E.right(this.cast(mockServer));
     } catch (error) {
@@ -324,31 +365,27 @@ export class MockServerService {
       });
       if (!mockServer) return E.left(MOCK_SERVER_NOT_FOUND);
 
-      // Check access permissions
-      if (mockServer.workspaceType === WorkspaceType.USER) {
-        if (mockServer.creatorUid !== userUid) {
-          return E.left(MOCK_SERVER_NOT_FOUND);
-        }
-      } else if (mockServer.workspaceType === WorkspaceType.TEAM) {
-        const isMember = await this.prisma.team.findFirst({
-          where: {
-            id: mockServer.workspaceID,
-            members: {
-              some: {
-                userUid,
-                role: { in: [TeamAccessRole.OWNER, TeamAccessRole.EDITOR] },
-              },
-            },
-          },
-        });
-        if (!isMember) return E.left(MOCK_SERVER_NOT_FOUND);
-      }
+      // Check access permissions (only OWNER and EDITOR can update)
+      const hasAccess = await this.checkMockServerAccess(mockServer, userUid, [
+        TeamAccessRole.OWNER,
+        TeamAccessRole.EDITOR,
+      ]);
+      if (!hasAccess) return E.left(MOCK_SERVER_NOT_FOUND);
 
       // Update the mock server
       const updated = await this.prisma.mockServer.update({
         where: { id },
         data: input,
       });
+      if (input.isActive !== undefined) {
+        this.mockServerAnalyticsService.recordActivity(
+          mockServer, // use pre-update state to determine action
+          input.isActive
+            ? MockServerAction.ACTIVATED
+            : MockServerAction.DEACTIVATED,
+          userUid,
+        );
+      }
 
       return E.right(this.cast(updated));
     } catch (error) {
@@ -367,31 +404,23 @@ export class MockServerService {
       });
       if (!mockServer) return E.left(MOCK_SERVER_NOT_FOUND);
 
-      // Check access permissions
-      if (mockServer.workspaceType === WorkspaceType.USER) {
-        if (mockServer.creatorUid !== userUid) {
-          return E.left(MOCK_SERVER_NOT_FOUND);
-        }
-      } else if (mockServer.workspaceType === WorkspaceType.TEAM) {
-        const isMember = await this.prisma.team.findFirst({
-          where: {
-            id: mockServer.workspaceID,
-            members: {
-              some: {
-                userUid,
-                role: { in: [TeamAccessRole.OWNER, TeamAccessRole.EDITOR] },
-              },
-            },
-          },
-        });
-        if (!isMember) return E.left(MOCK_SERVER_NOT_FOUND);
-      }
+      // Check access permissions (only OWNER and EDITOR can delete)
+      const hasAccess = await this.checkMockServerAccess(mockServer, userUid, [
+        TeamAccessRole.OWNER,
+        TeamAccessRole.EDITOR,
+      ]);
+      if (!hasAccess) return E.left(MOCK_SERVER_NOT_FOUND);
 
       // Soft delete the mock server
       await this.prisma.mockServer.update({
         where: { id },
         data: { isActive: false, deletedAt: new Date() },
       });
+      this.mockServerAnalyticsService.recordActivity(
+        mockServer, // use pre-update state to determine action
+        MockServerAction.DELETED,
+        userUid,
+      );
 
       return E.right(true);
     } catch (error) {
@@ -401,12 +430,170 @@ export class MockServerService {
   }
 
   /**
+   * Log a mock server request and response
+   */
+  async logRequest(params: {
+    mockServerID: string;
+    requestMethod: string;
+    requestPath: string;
+    requestHeaders: Record<string, string>;
+    requestBody?: any;
+    requestQuery?: Record<string, string>;
+    responseStatus: number;
+    responseHeaders: Record<string, string>;
+    responseTime: number;
+    ipAddress?: string;
+    userAgent?: string;
+  }): Promise<void> {
+    try {
+      await this.prisma.mockServerLog.create({
+        data: {
+          mockServerID: params.mockServerID,
+          requestMethod: params.requestMethod,
+          requestPath: params.requestPath,
+          requestHeaders: params.requestHeaders,
+          requestBody: params.requestBody || null,
+          requestQuery: params.requestQuery || null,
+          responseStatus: params.responseStatus,
+          responseHeaders: params.responseHeaders,
+          responseBody: null, // We'll capture response body separately if needed
+          responseTime: params.responseTime,
+          ipAddress: params.ipAddress || null,
+          userAgent: params.userAgent || null,
+        },
+      });
+    } catch (error) {
+      console.error('Error logging request:', error);
+      // Don't throw error - analytics shouldn't break the main flow
+    }
+  }
+
+  /**
+   * Get logs for a mock server with pagination
+   * Logs are sorted by execution time in descending order (most recent first)
+   */
+  async getMockServerLogs(
+    mockServerId: string,
+    userUid: string,
+    args: OffsetPaginationArgs,
+  ) {
+    try {
+      // First, get the mock server and verify it exists
+      const mockServer = await this.prisma.mockServer.findFirst({
+        where: { id: mockServerId, deletedAt: null },
+      });
+
+      if (!mockServer) return E.left(MOCK_SERVER_NOT_FOUND);
+
+      // Check access permissions - user must have access to the mock server
+      const hasAccess = await this.checkMockServerAccess(mockServer, userUid, [
+        TeamAccessRole.OWNER,
+        TeamAccessRole.EDITOR,
+        TeamAccessRole.VIEWER,
+      ]);
+      if (!hasAccess) return E.left(MOCK_SERVER_NOT_FOUND);
+
+      // Fetch logs with pagination, sorted by executedAt descending
+      const logs = await this.prisma.mockServerLog.findMany({
+        where: { mockServerID: mockServerId },
+        orderBy: { executedAt: 'desc' },
+        take: args?.take,
+        skip: args?.skip,
+      });
+
+      // Convert JSON fields to strings for GraphQL
+      const formattedLogs = logs.map(
+        (log) =>
+          ({
+            id: log.id,
+            mockServerID: log.mockServerID,
+            requestMethod: log.requestMethod,
+            requestPath: log.requestPath,
+            requestHeaders: JSON.stringify(log.requestHeaders),
+            requestBody: log.requestBody
+              ? JSON.stringify(log.requestBody)
+              : null,
+            requestQuery: log.requestQuery
+              ? JSON.stringify(log.requestQuery)
+              : null,
+            responseStatus: log.responseStatus,
+            responseHeaders: JSON.stringify(log.responseHeaders),
+            responseBody: log.responseBody
+              ? JSON.stringify(log.responseBody)
+              : null,
+            responseTime: log.responseTime,
+            ipAddress: log.ipAddress,
+            userAgent: log.userAgent,
+            executedAt: log.executedAt,
+          }) as MockServerLog,
+      );
+
+      return E.right(formattedLogs);
+    } catch (error) {
+      console.error('Error fetching mock server logs:', error);
+      return E.left(MOCK_SERVER_NOT_FOUND);
+    }
+  }
+
+  /**
+   * Delete a mock server log by logId
+   */
+  async deleteMockServerLog(logId: string, userUid: string) {
+    try {
+      // First, find the log and verify it exists
+      const log = await this.prisma.mockServerLog.findUnique({
+        where: { id: logId },
+        include: { mockServer: true },
+      });
+
+      if (!log) return E.left(MOCK_SERVER_LOG_NOT_FOUND);
+
+      // Check access permissions - user must have access to the mock server
+      const hasAccess = await this.checkMockServerAccess(
+        log.mockServer,
+        userUid,
+        [TeamAccessRole.OWNER, TeamAccessRole.EDITOR],
+      );
+      if (!hasAccess) return E.left(MOCK_SERVER_LOG_NOT_FOUND);
+
+      // Delete the log
+      await this.prisma.mockServerLog.delete({
+        where: { id: logId },
+      });
+
+      return E.right(true);
+    } catch (error) {
+      console.error('Error deleting mock server log:', error);
+      return E.left(MOCK_SERVER_LOG_DELETION_FAILED);
+    }
+  }
+
+  /**
+   * Increment hit count and update last hit timestamp for a mock server
+   */
+  async incrementHitCount(mockServerID: string): Promise<void> {
+    try {
+      await this.prisma.mockServer.update({
+        where: { id: mockServerID },
+        data: {
+          hitCount: { increment: 1 },
+          lastHitAt: new Date(),
+        },
+      });
+    } catch (error) {
+      console.error('Error incrementing hit count:', error);
+      // Don't throw error - analytics shouldn't break the main flow
+    }
+  }
+
+  /**
    * Handle mock request - find matching request in collection and return response
    * Optimized implementation with database-level filtering:
-   * 1. Check custom headers first (fastest path)
-   * 2. Fetch only relevant requests from DB (filtered by collection)
-   * 3. Filter and score examples in-memory
-   * 4. Return highest scoring example
+   * 1. Fetch collection IDs once (used for all subsequent queries)
+   * 2. Check custom headers first (fastest path)
+   * 3. Fetch only relevant requests from DB (filtered by collection)
+   * 4. Filter and score examples in-memory
+   * 5. Return highest scoring example
    */
   async handleMockRequest(
     subdomain: string,
@@ -424,6 +611,17 @@ export class MockServerService {
 
       const mockServer = mockServerResult.right;
 
+      // OPTIMIZATION: Fetch collection IDs once (recursive DB query)
+      // This is used by both custom header lookup and candidate fetching
+      const collectionIds = await this.getCollectionIds(mockServer);
+
+      // OPTIMIZATION: Fetch all requests with examples once (single DB query)
+      // This is shared between custom header lookup and candidate matching
+      const requests = await this.fetchRequestsWithExamples(
+        mockServer,
+        collectionIds,
+      );
+
       // OPTIMIZATION: Check for custom headers first (fastest path)
       // If user specified exact example, return it immediately without scoring
       if (requestHeaders) {
@@ -431,8 +629,8 @@ export class MockServerService {
         const mockResponseName = requestHeaders['x-mock-response-name'];
 
         if (mockResponseId || mockResponseName) {
-          const exactMatch = await this.findExampleByIdOrName(
-            mockServer,
+          const exactMatch = this.findExampleByIdOrName(
+            requests,
             mockResponseId,
             mockResponseName,
             method,
@@ -445,8 +643,8 @@ export class MockServerService {
 
       // OPTIMIZATION: Fetch only requests with mockExamples (database-level filter)
       // This is much faster than loading all requests and filtering in memory
-      const candidateExamples = await this.fetchCandidateExamples(
-        mockServer,
+      const candidateExamples = this.fetchCandidateExamples(
+        requests,
         method,
         path,
       );
@@ -506,41 +704,46 @@ export class MockServerService {
   }
 
   /**
-   * OPTIMIZED: Find example by ID or name directly from database
+   * Fetch all requests with mock examples from the database
+   * Shared helper to avoid code duplication
+   */
+  private async fetchRequestsWithExamples(
+    mockServer: dbMockServer,
+    collectionIds: string[],
+  ) {
+    return mockServer.workspaceType === WorkspaceType.USER
+      ? await this.prisma.userRequest.findMany({
+          where: {
+            collectionID: { in: collectionIds },
+            mockExamples: { not: null },
+          },
+          select: {
+            id: true,
+            mockExamples: true,
+          },
+        })
+      : await this.prisma.teamRequest.findMany({
+          where: {
+            collectionID: { in: collectionIds },
+            mockExamples: { not: null },
+          },
+          select: {
+            id: true,
+            mockExamples: true,
+          },
+        });
+  }
+
+  /**
+   * OPTIMIZED: Find example by ID or name from already-fetched requests
    * This avoids loading all examples when user specifies exact match
    */
-  private async findExampleByIdOrName(
-    mockServer: dbMockServer,
+  private findExampleByIdOrName(
+    requests: Array<{ id: string; mockExamples: any }>,
     exampleId?: string,
     exampleName?: string,
     method?: string,
   ) {
-    const collectionIds = await this.getCollectionIds(mockServer);
-
-    // Build database query
-    const requests =
-      mockServer.workspaceType === WorkspaceType.USER
-        ? await this.prisma.userRequest.findMany({
-            where: {
-              collectionID: { in: collectionIds },
-              mockExamples: { not: null },
-            },
-            select: {
-              id: true,
-              mockExamples: true,
-            },
-          })
-        : await this.prisma.teamRequest.findMany({
-            where: {
-              collectionID: { in: collectionIds },
-              mockExamples: { not: null },
-            },
-            select: {
-              id: true,
-              mockExamples: true,
-            },
-          });
-
     // Search through examples
     for (const request of requests) {
       const mockExamples = request.mockExamples as any;
@@ -575,10 +778,10 @@ export class MockServerService {
 
   /**
    * OPTIMIZED: Fetch only candidate examples that could match the request
-   * Uses database filtering to reduce memory usage
+   * Uses in-memory filtering from already-fetched requests
    */
-  private async fetchCandidateExamples(
-    mockServer: dbMockServer,
+  private fetchCandidateExamples(
+    requests: Array<{ id: string; mockExamples: any }>,
     method: string,
     path: string,
   ) {
@@ -597,32 +800,6 @@ export class MockServerService {
     }
 
     const examples: Example[] = [];
-    const collectionIds = await this.getCollectionIds(mockServer);
-
-    // OPTIMIZATION: Only fetch requests that have mockExamples
-    // This uses database filtering instead of loading everything
-    const requests =
-      mockServer.workspaceType === WorkspaceType.USER
-        ? await this.prisma.userRequest.findMany({
-            where: {
-              collectionID: { in: collectionIds },
-              mockExamples: { not: null }, // Only fetch requests with examples
-            },
-            select: {
-              id: true,
-              mockExamples: true,
-            },
-          })
-        : await this.prisma.teamRequest.findMany({
-            where: {
-              collectionID: { in: collectionIds },
-              mockExamples: { not: null }, // Only fetch requests with examples
-            },
-            select: {
-              id: true,
-              mockExamples: true,
-            },
-          });
 
     // Parse and filter examples
     for (const request of requests) {
@@ -667,12 +844,8 @@ export class MockServerService {
       return false; // Different structure, can't match
     }
 
-    // Quick check: if example has variables, it could match
-    if (
-      examplePath.includes(':') ||
-      examplePath.includes('{') ||
-      examplePath.includes('{{')
-    ) {
+    // Quick check: if example has variables (Hoppscotch uses <<variable>> syntax), it could match
+    if (examplePath.includes('<<')) {
       return true; // Has variables, needs full scoring
     }
 
@@ -736,14 +909,15 @@ export class MockServerService {
     try {
       // Parse endpoint to extract path and query parameters
       let path = '/';
-      let queryParams: Record<string, string> = {};
+      const queryParams: Record<string, string> = {};
 
       if (exampleData.endpoint) {
         const url = new URL(
           exampleData.endpoint,
           'http://dummy.com', // Base URL for parsing
         );
-        path = url.pathname;
+        // Decode the pathname to preserve Hoppscotch variable syntax (<<variable>>)
+        path = decodeURIComponent(url.pathname);
 
         // Extract query parameters
         url.searchParams.forEach((value, key) => {
@@ -799,12 +973,11 @@ export class MockServerService {
         const examplePart = examplePathParts[i];
         const requestPart = requestPathParts[i];
 
-        // Check if it's a variable (contains special chars or is a placeholder)
+        // Check if it's a variable (Hoppscotch uses <<variable>> syntax)
         if (
           examplePart === requestPart ||
-          examplePart.startsWith(':') ||
-          examplePart.startsWith('{') ||
-          examplePart.includes('{{')
+          examplePart.startsWith('<<') ||
+          examplePart.includes('<<')
         ) {
           continue; // Match
         } else {
